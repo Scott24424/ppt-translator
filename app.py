@@ -1,5 +1,6 @@
 import streamlit as st
 import io
+import json
 from pptx import Presentation
 from google import genai
 from pptx.oxml.ns import qn
@@ -10,29 +11,42 @@ st.set_page_config(page_title="주간보고 PPTX 자동 번역기", layout="cent
 st.title("📄 주간보고 PPTX 자동 번역기")
 st.markdown("한국어 주간보고 PPTX를 업로드하면, 비즈니스 중국어로 완벽하게 번역하여 폰트(Microsoft YaHei)까지 자동 적용해 줍니다.")
 
-# API Key 입력 (사용자 편의를 위해 UI에서 직접 입력)
 api_key = st.text_input("🔑 Google Gemini API Key를 입력하세요", type="password")
 
-def translate_to_chinese(text, client):
-    if not text or not text.strip():
-        return text
-    
+def batch_translate(texts, client):
+    """
+    모든 텍스트를 모아서 단 1번의 API 호출로 번역합니다. 
+    (하루 20회 무료 호출 제한을 우회하기 위한 구조적 해결책)
+    """
+    if not texts:
+        return []
+        
     prompt = f"""
-    Translate the following Korean business weekly report text into professional, natural business Chinese. 
+    Translate the following JSON array of Korean business weekly report texts into professional, natural business Chinese.
     Maintain the original tone, formatting, and any bullet points. Do not add any extra explanations.
+    Return ONLY a valid JSON array of strings in the exact same order.
     
-    Korean Text:
-    {text}
+    Korean Texts:
+    {json.dumps(texts, ensure_ascii=False)}
     """
     try:
         response = client.models.generate_content(
             model='gemini-3.8-flash',
             contents=prompt,
+            # JSON 형태로 응답을 강제하여 정확한 매핑 보장
+            config={"response_mime_type": "application/json"}
         )
-        return response.text.strip()
+        translated_list = json.loads(response.text)
+        
+        if len(translated_list) != len(texts):
+            st.warning("경고: 원본 문장 수와 번역된 문장 수가 일치하지 않아 일부 텍스트가 누락될 수 있습니다.")
+            # 길이가 안맞으면 일단 안전하게 원본 유지
+            return texts
+            
+        return translated_list
     except Exception as e:
-        st.error(f"번역 중 오류 발생: {e}")
-        return text
+        st.error(f"일괄 번역 중 오류 발생: {e}")
+        return texts
 
 def apply_chinese_font(run):
     run.font.name = 'Microsoft YaHei'
@@ -44,19 +58,6 @@ def apply_chinese_font(run):
     else:
         ea.set('typeface', 'Microsoft YaHei')
 
-def process_text_frame(text_frame, client):
-    for paragraph in text_frame.paragraphs:
-        full_text = "".join(run.text for run in paragraph.runs).strip()
-        if full_text:
-            translated_text = translate_to_chinese(full_text, client)
-            if paragraph.runs:
-                for i, run in enumerate(paragraph.runs):
-                    if i == 0:
-                        run.text = translated_text
-                        apply_chinese_font(run)
-                    else:
-                        run.text = ""
-
 uploaded_file = st.file_uploader("업로드할 PPTX 파일을 선택하세요", type=["pptx"])
 
 if uploaded_file is not None:
@@ -64,44 +65,76 @@ if uploaded_file is not None:
         if not api_key:
             st.warning("API Key를 먼저 입력해 주세요!")
         else:
-            client = genai.Client(api_key=api_key)
+            clean_api_key = api_key.strip()
+            client = genai.Client(api_key=clean_api_key)
             
-            with st.spinner("PPTX 파일을 분석하고 번역하는 중입니다. (약 1~2분 소요)"):
+            with st.spinner("PPTX 파일을 분석하고 번역하는 중입니다. (단 1회의 통신으로 일괄 번역 진행 중...)"):
                 try:
-                    # 메모리상에서 PPTX 읽기
                     prs = Presentation(uploaded_file)
                     
                     if len(prs.slides) < 2:
                         st.error("오류: PPTX 파일은 최소 2장(1페이지 번역 대상, 2페이지 원본 유지)으로 구성되어야 합니다.")
                     else:
-                        # 2페이지 번역
+                        # 1단계: 번역할 모든 문단을 추출하여 리스트에 담기
+                        paragraphs_to_translate = []
+                        original_texts = []
+                        
+                        # 2페이지
                         for shape in prs.slides[1].shapes:
                             if hasattr(shape, "text_frame") and shape.text_frame:
-                                process_text_frame(shape.text_frame, client)
+                                for p in shape.text_frame.paragraphs:
+                                    t = "".join(r.text for r in p.runs).strip()
+                                    if t:
+                                        paragraphs_to_translate.append(p)
+                                        original_texts.append(t)
                             elif shape.has_table:
                                 for row in shape.table.rows:
                                     for cell in row.cells:
                                         if hasattr(cell, "text_frame") and cell.text_frame:
-                                            process_text_frame(cell.text_frame, client)
+                                            for p in cell.text_frame.paragraphs:
+                                                t = "".join(r.text for r in p.runs).strip()
+                                                if t:
+                                                    paragraphs_to_translate.append(p)
+                                                    original_texts.append(t)
                         
-                        # 3페이지 이후 번역
+                        # 3페이지 이후
                         for slide_idx in range(2, len(prs.slides)):
                             for shape in prs.slides[slide_idx].shapes:
                                 if hasattr(shape, "text_frame") and shape.text_frame:
-                                    process_text_frame(shape.text_frame, client)
+                                    for p in shape.text_frame.paragraphs:
+                                        t = "".join(r.text for r in p.runs).strip()
+                                        if t:
+                                            paragraphs_to_translate.append(p)
+                                            original_texts.append(t)
                                 if shape.has_table:
                                     for row in shape.table.rows:
                                         for cell in row.cells:
                                             if hasattr(cell, "text_frame") and cell.text_frame:
-                                                process_text_frame(cell.text_frame, client)
+                                                for p in cell.text_frame.paragraphs:
+                                                    t = "".join(r.text for r in p.runs).strip()
+                                                    if t:
+                                                        paragraphs_to_translate.append(p)
+                                                        original_texts.append(t)
                         
-                        # 번역 완료된 PPTX를 메모리에 저장
+                        # 2단계: 단 1번의 API 호출로 전체 일괄 번역
+                        if original_texts:
+                            translated_texts = batch_translate(original_texts, client)
+                            
+                            # 3단계: 번역된 텍스트를 원래 문단에 주입 및 폰트 변경
+                            for p, t_text in zip(paragraphs_to_translate, translated_texts):
+                                if p.runs:
+                                    for i, run in enumerate(p.runs):
+                                        if i == 0:
+                                            run.text = t_text
+                                            apply_chinese_font(run)
+                                        else:
+                                            run.text = ""
+                        
                         output_stream = io.BytesIO()
                         prs.save(output_stream)
                         output_stream.seek(0)
                         
                         st.success("✅ 번역이 완료되었습니다!")
-                        
                         original_name = uploaded_file.name.replace(".pptx", "")
                         st.download_button(
                             label="📥 번역된 PPTX 다운로드",
