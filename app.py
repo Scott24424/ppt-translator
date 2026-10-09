@@ -1,6 +1,7 @@
 import streamlit as st
 import io
 import json
+import time
 from pptx import Presentation
 from google import genai
 from pptx.oxml.ns import qn
@@ -13,11 +14,8 @@ st.markdown("한국어 주간보고 PPTX를 업로드하면, 비즈니스 중국
 
 api_key = st.text_input("🔑 Google Gemini API Key를 입력하세요", type="password")
 
-def batch_translate(texts, client):
-    """
-    모든 텍스트를 모아서 단 1번의 API 호출로 번역합니다. 
-    (하루 20회 무료 호출 제한을 우회하기 위한 구조적 해결책)
-    """
+def batch_translate(texts, client, retries=5):
+    """모든 텍스트를 모아서 단 1번의 API 호출로 번역합니다. (503 에러 시 자동 재시도 포함)"""
     if not texts:
         return []
         
@@ -29,24 +27,34 @@ def batch_translate(texts, client):
     Korean Texts:
     {json.dumps(texts, ensure_ascii=False)}
     """
-    try:
-        response = client.models.generate_content(
-            model='gemini-3.8-flash',
-            contents=prompt,
-            # JSON 형태로 응답을 강제하여 정확한 매핑 보장
-            config={"response_mime_type": "application/json"}
-        )
-        translated_list = json.loads(response.text)
-        
-        if len(translated_list) != len(texts):
-            st.warning("경고: 원본 문장 수와 번역된 문장 수가 일치하지 않아 일부 텍스트가 누락될 수 있습니다.")
-            # 길이가 안맞으면 일단 안전하게 원본 유지
+    
+    for attempt in range(retries):
+        try:
+            response = client.models.generate_content(
+                model='gemini-3.8-flash',
+                contents=prompt,
+                config={"response_mime_type": "application/json"}
+            )
+            translated_list = json.loads(response.text)
+            
+            if len(translated_list) != len(texts):
+                st.warning("경고: 원본 문장 수와 번역된 문장 수가 일치하지 않아 일부 텍스트가 누락될 수 있습니다.")
+                return texts
+                
+            return translated_list
+            
+        except Exception as e:
+            error_msg = str(e)
+            if "503" in error_msg or "UNAVAILABLE" in error_msg:
+                if attempt < retries - 1:
+                    wait_time = (attempt + 1) * 3
+                    st.toast(f"구글 서버 과부하(503) 발생. {wait_time}초 후 자동 재시도합니다... (시도 {attempt+1}/{retries})", icon="⏳")
+                    time.sleep(wait_time)
+                    continue
+            st.error(f"일괄 번역 중 오류 발생: {e}")
             return texts
             
-        return translated_list
-    except Exception as e:
-        st.error(f"일괄 번역 중 오류 발생: {e}")
-        return texts
+    return texts
 
 def apply_chinese_font(run):
     run.font.name = 'Microsoft YaHei'
@@ -75,7 +83,6 @@ if uploaded_file is not None:
                     if len(prs.slides) < 2:
                         st.error("오류: PPTX 파일은 최소 2장(1페이지 번역 대상, 2페이지 원본 유지)으로 구성되어야 합니다.")
                     else:
-                        # 1단계: 번역할 모든 문단을 추출하여 리스트에 담기
                         paragraphs_to_translate = []
                         original_texts = []
                         
@@ -116,11 +123,9 @@ if uploaded_file is not None:
                                                         paragraphs_to_translate.append(p)
                                                         original_texts.append(t)
                         
-                        # 2단계: 단 1번의 API 호출로 전체 일괄 번역
                         if original_texts:
                             translated_texts = batch_translate(original_texts, client)
                             
-                            # 3단계: 번역된 텍스트를 원래 문단에 주입 및 폰트 변경
                             for p, t_text in zip(paragraphs_to_translate, translated_texts):
                                 if p.runs:
                                     for i, run in enumerate(p.runs):
